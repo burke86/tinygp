@@ -56,7 +56,7 @@ def _symm_qsm_cholesky_impl(
         fk = ak @ tmp + wk[:, None] * wk[None, :]
         return fk, (ck, wk)
 
-    init_dtype = jnp.result_type(d.dtype, p.dtype, q.dtype, a.dtype)
+    init_dtype = jnp.result_type(d, p, q)
     init = jnp.zeros((q.shape[1], q.shape[1]), dtype=init_dtype)
     _, (c, w) = jax.lax.scan(impl, init, (d, p, q, a))
     return c, w
