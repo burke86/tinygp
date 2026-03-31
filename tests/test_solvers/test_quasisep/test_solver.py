@@ -7,6 +7,7 @@ from numpy import random as np_random
 
 from tinygp import GaussianProcess, kernels
 from tinygp.kernels import quasisep
+from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, SymmQSM
 from tinygp.solvers import DirectSolver, QuasisepSolver
 from tinygp.test_utils import assert_allclose
 
@@ -22,6 +23,20 @@ def data(random):
     y = jnp.sin(x)
     t = jnp.sort(random.uniform(-3, 3, 10))
     return x, y, t
+
+
+def legacy_to_symm_qsm(kernel, X):
+    Pinf = kernel.stationary_covariance()
+    X_prev = jax.tree_util.tree_map(
+        lambda y: jnp.concatenate((jnp.asarray(y[:1]), jnp.asarray(y[:-1]))), X
+    )
+    a = jax.vmap(kernel.transition_matrix)(X_prev, X)
+    h = jax.vmap(kernel.observation_model)(X)
+    q = h
+    p = h @ Pinf
+    d = jnp.sum(p * q, axis=1)
+    p = jax.vmap(lambda x, y: x @ y)(p, a)
+    return SymmQSM(diag=DiagQSM(d=d), lower=StrictLowerTriQSM(p=p, q=q, a=a))
 
 
 @pytest.fixture(
@@ -93,6 +108,44 @@ def test_consistent_with_direct(kernel_pair, data):
     assert_allclose(gp1p.gp.loc, gp2p.gp.loc)
     assert_allclose(gp1p.gp.variance, gp2p.gp.variance)
     assert_allclose(gp1p.gp.covariance, gp2p.gp.covariance)
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        quasisep.Matern32(sigma=1.8, scale=1.5),
+        quasisep.Matern52(sigma=1.8, scale=1.5),
+        quasisep.Exp(sigma=1.8, scale=1.5),
+        quasisep.Celerite(1.1, 0.8, 0.9, 0.1),
+    ],
+)
+def test_to_symm_qsm_matches_legacy(kernel, data):
+    x, _, _ = data
+    expected = legacy_to_symm_qsm(kernel, x)
+    actual = kernel.to_symm_qsm(x)
+
+    assert_allclose(actual.diag.d, expected.diag.d)
+    assert_allclose(actual.lower.p, expected.lower.p)
+    assert_allclose(actual.lower.q, expected.lower.q)
+    assert_allclose(actual.lower.a, expected.lower.a)
+
+
+def test_covariance_reuse_path(data):
+    kernel = quasisep.Matern32(sigma=1.8, scale=1.5)
+    x, y, _ = data
+
+    gp = GaussianProcess(kernel, x, diag=0.1, solver=QuasisepSolver)
+    gp_reuse = GaussianProcess(
+        kernel,
+        x,
+        diag=0.1,
+        solver=QuasisepSolver,
+        covariance_value=gp.solver.matrix,
+    )
+
+    assert_allclose(gp_reuse.covariance, gp.covariance)
+    assert_allclose(gp_reuse.solver.normalization(), gp.solver.normalization())
+    assert_allclose(gp_reuse.log_probability(y), gp.log_probability(y))
 
 
 def test_celerite(data):

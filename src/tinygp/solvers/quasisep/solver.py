@@ -2,6 +2,7 @@ from __future__ import annotations
 
 __all__ = ["QuasisepSolver"]
 
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -11,8 +12,20 @@ import numpy as np
 from tinygp.helpers import JAXArray
 from tinygp.kernels.base import Kernel
 from tinygp.noise import Noise
-from tinygp.solvers.quasisep.core import LowerTriQSM, SymmQSM
+from tinygp.solvers.quasisep.core import DiagQSM, LowerTriQSM, SymmQSM
 from tinygp.solvers.solver import Solver
+
+
+@jax.jit
+def _add_noise(matrix: SymmQSM, noise_qsm: SymmQSM | DiagQSM) -> SymmQSM:
+    result = matrix + noise_qsm
+    assert isinstance(result, SymmQSM)
+    return result
+
+
+@jax.jit
+def _factorize(matrix: SymmQSM) -> LowerTriQSM:
+    return matrix.cholesky()
 
 
 class QuasisepSolver(Solver):
@@ -62,15 +75,14 @@ class QuasisepSolver(Solver):
                 assert isinstance(kernel, Quasisep)
             if not assume_sorted:
                 jax.debug.callback(_check_sorted, kernel.coord_to_sortable(X))
-            matrix = kernel.to_symm_qsm(X)
-            matrix += noise.to_qsm()
+            matrix = _add_noise(kernel.to_symm_qsm(X), noise.to_qsm())
         else:
             if TYPE_CHECKING:
                 assert isinstance(covariance, SymmQSM)
             matrix = covariance
         self.X = X
         self.matrix = matrix
-        self.factor = matrix.cholesky()
+        self.factor = _factorize(matrix)
 
     def variance(self) -> JAXArray:
         return self.matrix.diag.d
@@ -78,17 +90,20 @@ class QuasisepSolver(Solver):
     def covariance(self) -> JAXArray:
         return self.matrix.to_dense()
 
+    @jax.jit
     def normalization(self) -> JAXArray:
         return jnp.sum(jnp.log(self.factor.diag.d)) + 0.5 * self.factor.shape[
             0
         ] * np.log(2 * np.pi)
 
+    @partial(jax.jit, static_argnames=("transpose",))
     def solve_triangular(self, y: JAXArray, *, transpose: bool = False) -> JAXArray:
         if transpose:
             return self.factor.transpose().solve(y)
         else:
             return self.factor.solve(y)
 
+    @jax.jit
     def dot_triangular(self, y: JAXArray) -> JAXArray:
         return self.factor @ y
 

@@ -192,11 +192,12 @@ class StrictLowerTriQSM(QSM):
     def matmul(self, x: JAXArray) -> JAXArray:
         def impl(f, data):  # type: ignore
             q, a, x = data
-            return a @ f + jnp.outer(q, x), f
+            return a @ f + q[:, None] * x[None, :], f
 
-        init = jnp.zeros_like(jnp.outer(self.q[0], x[0]))
+        init_dtype = jnp.result_type(self.q.dtype, x.dtype)
+        init = jnp.zeros((self.q.shape[1], x.shape[1]), dtype=init_dtype)
         _, f = jax.lax.scan(impl, init, (self.q, self.a, x))
-        return jax.vmap(jnp.dot)(self.p, f)
+        return jnp.einsum("nm,nmk->nk", self.p, f)
 
     def scale(self, other: JAXArray) -> StrictLowerTriQSM:
         return StrictLowerTriQSM(p=self.p * other, q=self.q, a=self.a)
@@ -265,11 +266,12 @@ class StrictUpperTriQSM(QSM):
     def matmul(self, x: JAXArray) -> JAXArray:
         def impl(f, data):  # type: ignore
             p, a, x = data
-            return a.T @ f + jnp.outer(p, x), f
+            return a.T @ f + p[:, None] * x[None, :], f
 
-        init = jnp.zeros_like(jnp.outer(self.p[-1], x[-1]))
+        init_dtype = jnp.result_type(self.p.dtype, x.dtype)
+        init = jnp.zeros((self.p.shape[1], x.shape[1]), dtype=init_dtype)
         _, f = jax.lax.scan(impl, init, (self.p, self.a, x), reverse=True)
-        return jax.vmap(jnp.dot)(self.q, f)
+        return jnp.einsum("nm,nmk->nk", self.q, f)
 
     def scale(self, other: JAXArray) -> StrictUpperTriQSM:
         return StrictUpperTriQSM(p=self.p, q=self.q * other, a=self.a)
@@ -331,10 +333,11 @@ class LowerTriQSM(QSM):
 
         def impl(fn, data):  # type: ignore
             ((cn,), (pn, wn, an)), yn = data
-            xn = (yn - pn @ fn) / cn
-            return an @ fn + jnp.outer(wn, xn), xn
+            xn = (yn - jnp.einsum("m,mk->k", pn, fn)) / cn
+            return an @ fn + wn[:, None] * xn[None, :], xn
 
-        init = jnp.zeros_like(jnp.outer(self.lower.q[0], y[0]))
+        init_dtype = jnp.result_type(self.lower.q.dtype, y.dtype)
+        init = jnp.zeros((self.lower.q.shape[1], y.shape[1]), dtype=init_dtype)
         _, x = jax.lax.scan(impl, init, (self, y))
         return x
 
@@ -381,10 +384,11 @@ class UpperTriQSM(QSM):
 
         def impl(fn, data):  # type: ignore
             ((cn,), (pn, wn, an)), yn = data
-            xn = (yn - wn @ fn) / cn
-            return an.T @ fn + jnp.outer(pn, xn), xn
+            xn = (yn - jnp.einsum("m,mk->k", wn, fn)) / cn
+            return an.T @ fn + pn[:, None] * xn[None, :], xn
 
-        init = jnp.zeros_like(jnp.outer(self.upper.p[-1], y[-1]))
+        init_dtype = jnp.result_type(self.upper.p.dtype, y.dtype)
+        init = jnp.zeros((self.upper.p.shape[1], y.shape[1]), dtype=init_dtype)
         _, x = jax.lax.scan(impl, init, (self, y), reverse=True)
         return x
 

@@ -40,6 +40,27 @@ from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, SymmQSM
 from tinygp.solvers.quasisep.general import GeneralQSM
 
 
+def _previous_inputs(X: JAXArray) -> JAXArray:
+    return jax.tree_util.tree_map(
+        lambda y: jnp.concatenate((jnp.asarray(y[:1]), jnp.asarray(y[:-1]))), X
+    )
+
+
+@eqx.filter_jit
+def _to_symm_qsm_impl(kernel: "Quasisep", X: JAXArray) -> SymmQSM:
+    Pinf = kernel.stationary_covariance()
+    X_prev = _previous_inputs(X)
+
+    def build_row(x_prev: JAXArray, x_cur: JAXArray) -> tuple[JAXArray, ...]:
+        a = kernel.transition_matrix(x_prev, x_cur)
+        h = kernel.observation_model(x_cur)
+        hP = h @ Pinf
+        return jnp.dot(hP, h), hP @ a, h, a
+
+    d, p, q, a = jax.vmap(build_row)(X_prev, X)
+    return SymmQSM(diag=DiagQSM(d=d), lower=StrictLowerTriQSM(p=p, q=q, a=a))
+
+
 class Quasisep(Kernel):
     """The base class for all quasiseparable kernels
 
@@ -88,23 +109,14 @@ class Quasisep(Kernel):
 
     def to_symm_qsm(self, X: JAXArray) -> SymmQSM:
         """The symmetric quasiseparable representation of this kernel"""
-        Pinf = self.stationary_covariance()
-        a = jax.vmap(self.transition_matrix)(
-            jax.tree_util.tree_map(lambda y: jnp.append(y[0], y[:-1]), X), X
-        )
-        h = jax.vmap(self.observation_model)(X)
-        q = h
-        p = h @ Pinf
-        d = jnp.sum(p * q, axis=1)
-        p = jax.vmap(lambda x, y: x @ y)(p, a)
-        return SymmQSM(diag=DiagQSM(d=d), lower=StrictLowerTriQSM(p=p, q=q, a=a))
+        return _to_symm_qsm_impl(self, X)
 
     def to_general_qsm(self, X1: JAXArray, X2: JAXArray) -> GeneralQSM:
         """The generalized quasiseparable representation of this kernel"""
         sortable = jax.vmap(self.coord_to_sortable)
         idx = jnp.searchsorted(sortable(X2), sortable(X1), side="right") - 1
 
-        Xs = jax.tree_util.tree_map(lambda x: jnp.append(x[0], x[:-1]), X2)
+        Xs = _previous_inputs(X2)
         Pinf = self.stationary_covariance()
         a = jax.vmap(self.transition_matrix)(Xs, X2)
         h1 = jax.vmap(self.observation_model)(X1)
