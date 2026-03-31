@@ -44,6 +44,25 @@ def handle_matvec_shapes(
     return wrapped
 
 
+def _symm_qsm_cholesky_impl(
+    d: JAXArray, p: JAXArray, q: JAXArray, a: JAXArray
+) -> tuple[JAXArray, JAXArray]:
+    def impl(carry, data):  # type: ignore
+        fp = carry
+        dk, pk, qk, ak = data
+        pkfp = pk @ fp
+        ck = jnp.sqrt(dk - pkfp @ pk)
+        tmp = fp @ ak.T
+        wk = (qk - pkfp @ ak.T) / ck
+        fk = ak @ tmp + wk[:, None] * wk[None, :]
+        return fk, (ck, wk)
+
+    init_dtype = jnp.result_type(d.dtype, p.dtype, q.dtype, a.dtype)
+    init = jnp.zeros((q.shape[1], q.shape[1]), dtype=init_dtype)
+    _, (c, w) = jax.lax.scan(impl, init, (d, p, q, a))
+    return c, w
+
+
 class QSM(eqx.Module):
     """The base class for all square quasiseparable matrices
 
