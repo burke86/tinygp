@@ -135,7 +135,13 @@ class GaussianProcess(eqx.Module):
             The marginal log probability of this multivariate normal model,
             evaluated at ``y``.
         """
-        return self._compute_log_prob(self._get_alpha(y))
+        centered = y - self.loc
+        centered_log_probability = getattr(
+            self.solver, "centered_log_probability", None
+        )
+        if centered_log_probability is not None:
+            return centered_log_probability(centered)
+        return self._compute_log_prob(self.solver.solve_triangular(centered))
 
     def condition(
         self,

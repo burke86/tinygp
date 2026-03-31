@@ -28,6 +28,31 @@ def _factorize(matrix: SymmQSM) -> LowerTriQSM:
     return matrix.cholesky()
 
 
+@jax.jit
+def _normalization_from_diag(diag: JAXArray) -> JAXArray:
+    return jnp.sum(jnp.log(diag)) + 0.5 * diag.shape[0] * np.log(2 * np.pi)
+
+
+@jax.jit
+def _centered_log_probability(factor: LowerTriQSM, y: JAXArray, norm: JAXArray) -> JAXArray:
+    y = jnp.reshape(y, (y.shape[0], -1))
+
+    def impl(carry, data):  # type: ignore
+        fn, quad = carry
+        ((cn,), (pn, wn, an)), yn = data
+        xn = (yn - pn @ fn) / cn
+        fn = an @ fn + jnp.outer(wn, xn)
+        quad = quad + jnp.sum(jnp.square(xn))
+        return (fn, quad), None
+
+    init_dtype = jnp.result_type(factor.lower.q.dtype, y.dtype)
+    init_f = jnp.zeros((factor.lower.q.shape[1], y.shape[1]), dtype=init_dtype)
+    init_q = jnp.zeros((), dtype=jnp.result_type(init_dtype, factor.diag.d.dtype))
+    (_, quad), _ = jax.lax.scan(impl, (init_f, init_q), (factor, y))
+    loglike = -0.5 * quad - norm
+    return jnp.where(jnp.isfinite(loglike), loglike, -jnp.inf)
+
+
 class QuasisepSolver(Solver):
     """A scalable solver that uses quasiseparable matrices
 
@@ -42,6 +67,7 @@ class QuasisepSolver(Solver):
     X: JAXArray
     matrix: SymmQSM
     factor: LowerTriQSM
+    normalization_value: JAXArray
 
     def __init__(
         self,
@@ -83,6 +109,7 @@ class QuasisepSolver(Solver):
         self.X = X
         self.matrix = matrix
         self.factor = _factorize(matrix)
+        self.normalization_value = _normalization_from_diag(self.factor.diag.d)
 
     def variance(self) -> JAXArray:
         return self.matrix.diag.d
@@ -92,9 +119,11 @@ class QuasisepSolver(Solver):
 
     @jax.jit
     def normalization(self) -> JAXArray:
-        return jnp.sum(jnp.log(self.factor.diag.d)) + 0.5 * self.factor.shape[
-            0
-        ] * np.log(2 * np.pi)
+        return self.normalization_value
+
+    @jax.jit
+    def centered_log_probability(self, y: JAXArray) -> JAXArray:
+        return _centered_log_probability(self.factor, y, self.normalization_value)
 
     @partial(jax.jit, static_argnames=("transpose",))
     def solve_triangular(self, y: JAXArray, *, transpose: bool = False) -> JAXArray:

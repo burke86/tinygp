@@ -148,6 +148,19 @@ def test_covariance_reuse_path(data):
     assert_allclose(gp_reuse.log_probability(y), gp.log_probability(y))
 
 
+def test_centered_log_probability_matches_solve_path(data):
+    kernel = quasisep.Matern32(sigma=1.8, scale=1.5)
+    x, y, _ = data
+    gp = GaussianProcess(kernel, x, diag=0.1, solver=QuasisepSolver)
+
+    centered = y - gp.loc
+    alpha = gp.solver.solve_triangular(centered)
+    expected = gp._compute_log_prob(alpha)
+
+    assert_allclose(gp.solver.centered_log_probability(centered), expected)
+    assert_allclose(gp.log_probability(y), expected)
+
+
 def test_celerite(data):
     celerite = pytest.importorskip("celerite")
 

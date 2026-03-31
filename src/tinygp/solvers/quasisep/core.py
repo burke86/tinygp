@@ -43,6 +43,25 @@ def handle_matvec_shapes(
     return wrapped
 
 
+def _symm_qsm_cholesky_impl(
+    d: JAXArray, p: JAXArray, q: JAXArray, a: JAXArray
+) -> tuple[JAXArray, JAXArray]:
+    def impl(carry, data):  # type: ignore
+        fp = carry
+        dk, pk, qk, ak = data
+        pkfp = pk @ fp
+        ck = jnp.sqrt(dk - pkfp @ pk)
+        tmp = fp @ ak.T
+        wk = (qk - pkfp @ ak.T) / ck
+        fk = ak @ tmp + wk[:, None] * wk[None, :]
+        return fk, (ck, wk)
+
+    init_dtype = jnp.result_type(d.dtype, p.dtype, q.dtype, a.dtype)
+    init = jnp.zeros((q.shape[1], q.shape[1]), dtype=init_dtype)
+    _, (c, w) = jax.lax.scan(impl, init, (d, p, q, a))
+    return c, w
+
+
 class QSM(eqx.Module):
     """The base class for all square quasiseparable matrices
 
@@ -556,18 +575,7 @@ class SymmQSM(QSM):
         """
         (d,) = self.diag
         p, q, a = self.lower
-
-        def impl(carry, data):  # type: ignore
-            fp = carry
-            dk, pk, qk, ak = data
-            ck = jnp.sqrt(dk - pk @ fp @ pk)
-            tmp = fp @ ak.T
-            wk = (qk - pk @ tmp) / ck
-            fk = ak @ tmp + jnp.outer(wk, wk)
-            return fk, (ck, wk)
-
-        init = jnp.zeros_like(jnp.outer(q[0], q[0]))
-        _, (c, w) = jax.lax.scan(impl, init, (d, p, q, a))
+        c, w = _symm_qsm_cholesky_impl(d, p, q, a)
         return LowerTriQSM(diag=DiagQSM(c), lower=StrictLowerTriQSM(p=p, q=w, a=a))
 
     def __neg__(self) -> SymmQSM:
