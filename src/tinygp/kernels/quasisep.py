@@ -50,15 +50,20 @@ def _previous_inputs(X: JAXArray) -> JAXArray:
 @eqx.filter_jit
 def _to_symm_qsm_impl(kernel: "Quasisep", X: JAXArray) -> SymmQSM:
     Pinf = kernel.stationary_covariance()
-    X_prev = _previous_inputs(X)
-
-    def build_row(x_prev: JAXArray, x_cur: JAXArray) -> tuple[JAXArray, ...]:
-        a = kernel.transition_matrix(x_prev, x_cur)
-        h = kernel.observation_model(x_cur)
-        hP = h @ Pinf
-        return jnp.dot(hP, h), hP @ a, h, a
-
-    d, p, q, a = jax.vmap(build_row)(X_prev, X)
+    transition_X = jax.vmap(kernel.transition_coordinate)(X)
+    transition_X_prev = _previous_inputs(transition_X)
+    h = jax.vmap(kernel.observation_model)(X)
+    if kernel.has_delta_transition():
+        dt = transition_X - transition_X_prev
+        a = jax.vmap(kernel.transition_matrix_from_delta)(dt)
+    else:
+        a = jax.vmap(kernel.transition_matrix_from_coordinate)(
+            transition_X_prev, transition_X
+        )
+    hP = h @ Pinf
+    d = jnp.einsum("ni,ni->n", hP, h)
+    p = jax.vmap(lambda x, y: x @ y)(hP, a)
+    q = h
     return SymmQSM(diag=DiagQSM(d=d), lower=StrictLowerTriQSM(p=p, q=q, a=a))
 
 
@@ -107,6 +112,27 @@ class Quasisep(Kernel):
         that structure.
         """
         return X
+
+    def transition_coordinate(self, X: JAXArray) -> JAXArray:
+        """The coordinate used to build transition matrices along the sequence.
+
+        For most kernels this is the same as :meth:`coord_to_sortable`, but this
+        hook lets structured inputs avoid carrying unrelated fields through the
+        transition-matrix path.
+        """
+        return self.coord_to_sortable(X)
+
+    def transition_matrix_from_coordinate(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        """The transition matrix evaluated using transition coordinates."""
+        return self.transition_matrix(X1, X2)
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
+        """The transition matrix evaluated from an adjacent coordinate delta."""
+        raise NotImplementedError
+
+    def has_delta_transition(self) -> bool:
+        """Whether this kernel supports a delta-based transition fast path."""
+        return False
 
     def to_symm_qsm(self, X: JAXArray) -> SymmQSM:
         """The symmetric quasiseparable representation of this kernel"""
@@ -231,6 +257,15 @@ class Wrapper(Quasisep):
             self.coord_to_sortable(X1), self.coord_to_sortable(X2)
         )
 
+    def transition_matrix_from_coordinate(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        return self.kernel.transition_matrix_from_coordinate(X1, X2)
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
+        return self.kernel.transition_matrix_from_delta(dt)
+
+    def has_delta_transition(self) -> bool:
+        return self.kernel.has_delta_transition()
+
 
 class Sum(Quasisep):
     """A helper to represent the sum of two quasiseparable kernels
@@ -288,6 +323,21 @@ class Sum(Quasisep):
             self.kernel2.transition_matrix(X1, X2),
         )
 
+    def transition_matrix_from_coordinate(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        return Block(
+            self.kernel1.transition_matrix_from_coordinate(X1, X2),
+            self.kernel2.transition_matrix_from_coordinate(X1, X2),
+        )
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
+        return Block(
+            self.kernel1.transition_matrix_from_delta(dt),
+            self.kernel2.transition_matrix_from_delta(dt),
+        )
+
+    def has_delta_transition(self) -> bool:
+        return self.kernel1.has_delta_transition() and self.kernel2.has_delta_transition()
+
 
 class Product(Quasisep):
     """A helper to represent the product of two quasiseparable kernels"""
@@ -323,6 +373,21 @@ class Product(Quasisep):
             self.kernel1.transition_matrix(X1, X2),
             self.kernel2.transition_matrix(X1, X2),
         )
+
+    def transition_matrix_from_coordinate(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
+        return _prod_helper(
+            self.kernel1.transition_matrix_from_coordinate(X1, X2),
+            self.kernel2.transition_matrix_from_coordinate(X1, X2),
+        )
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
+        return _prod_helper(
+            self.kernel1.transition_matrix_from_delta(dt),
+            self.kernel2.transition_matrix_from_delta(dt),
+        )
+
+    def has_delta_transition(self) -> bool:
+        return self.kernel1.has_delta_transition() and self.kernel2.has_delta_transition()
 
 
 class Scale(Wrapper):
@@ -389,10 +454,15 @@ class Celerite(Quasisep):
         return jnp.array([h1, h2])
 
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-        dt = X2 - X1
+        return self.transition_matrix_from_delta(X2 - X1)
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
         cos = jnp.cos(self.d * dt)
         sin = jnp.sin(self.d * dt)
         return jnp.exp(-self.c * dt) * jnp.array([[cos, -sin], [sin, cos]]).T
+
+    def has_delta_transition(self) -> bool:
+        return True
 
 
 class SHO(Quasisep):
@@ -441,7 +511,9 @@ class SHO(Quasisep):
         return jnp.array([self.sigma, 0])
 
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-        dt = X2 - X1
+        return self.transition_matrix_from_delta(X2 - X1)
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
         w = self.omega
         q = self.quality
 
@@ -481,6 +553,9 @@ class SHO(Quasisep):
             dt,
         )
 
+    def has_delta_transition(self) -> bool:
+        return True
+
 
 class Exp(Quasisep):
     r"""A scalable implementation of :class:`tinygp.kernels.stationary.Exp`
@@ -515,8 +590,13 @@ class Exp(Quasisep):
         return jnp.array([self.sigma])
 
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-        dt = X2 - X1
+        return self.transition_matrix_from_delta(X2 - X1)
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
         return jnp.exp(-dt[None, None] / self.scale)
+
+    def has_delta_transition(self) -> bool:
+        return True
 
 
 class Matern32(Quasisep):
@@ -556,11 +636,16 @@ class Matern32(Quasisep):
         return jnp.array([self.sigma, 0])
 
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-        dt = X2 - X1
+        return self.transition_matrix_from_delta(X2 - X1)
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
         f = np.sqrt(3) / self.scale
         return jnp.exp(-f * dt) * jnp.array(
             [[1 + f * dt, -jnp.square(f) * dt], [dt, 1 - f * dt]]
         )
+
+    def has_delta_transition(self) -> bool:
+        return True
 
 
 class Matern52(Quasisep):
@@ -602,7 +687,9 @@ class Matern52(Quasisep):
         return jnp.array([self.sigma, 0, 0])
 
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-        dt = X2 - X1
+        return self.transition_matrix_from_delta(X2 - X1)
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
         f = np.sqrt(5) / self.scale
         f2 = jnp.square(f)
         d2 = jnp.square(dt)
@@ -625,6 +712,9 @@ class Matern52(Quasisep):
                 ],
             ]
         )
+
+    def has_delta_transition(self) -> bool:
+        return True
 
 
 class Cosine(Quasisep):
@@ -660,11 +750,16 @@ class Cosine(Quasisep):
         return jnp.array([self.sigma, 0])
 
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-        dt = X2 - X1
+        return self.transition_matrix_from_delta(X2 - X1)
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
         f = 2 * np.pi / self.scale
         cos = jnp.cos(f * dt)
         sin = jnp.sin(f * dt)
         return jnp.array([[cos, sin], [-sin, cos]])
+
+    def has_delta_transition(self) -> bool:
+        return True
 
 
 def _prod_helper(a1: JAXArray, a2: JAXArray) -> JAXArray:
@@ -878,7 +973,9 @@ class CARMA(Quasisep):
         return self.obsmodel
 
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-        dt = X2 - X1
+        return self.transition_matrix_from_delta(X2 - X1)
+
+    def transition_matrix_from_delta(self, dt: JAXArray) -> JAXArray:
         c = -self.arroots.real
         d = -self.arroots.imag
         decay = jnp.exp(-c * dt)
@@ -892,6 +989,9 @@ class CARMA(Quasisep):
         )
 
         return tm_real + tm_complex_diag + -tm_complex_u.T + tm_complex_u
+
+    def has_delta_transition(self) -> bool:
+        return True
 
 
 @jax.jit
