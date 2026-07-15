@@ -7,8 +7,8 @@ from numpy import random as np_random
 
 from tinygp import GaussianProcess, kernels
 from tinygp.kernels import quasisep
-from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, SymmQSM
 from tinygp.solvers import DirectSolver, QuasisepSolver
+from tinygp.solvers.quasisep.core import DiagQSM, StrictLowerTriQSM, SymmQSM
 from tinygp.test_utils import assert_allclose
 
 
@@ -25,17 +25,17 @@ def data(random):
     return x, y, t
 
 
-def legacy_to_symm_qsm(kernel, X):
+def reference_to_symm_qsm(kernel, X):
     Pinf = kernel.stationary_covariance()
     X_prev = jax.tree_util.tree_map(
         lambda y: jnp.concatenate((jnp.asarray(y[:1]), jnp.asarray(y[:-1]))), X
     )
     a = jax.vmap(kernel.transition_matrix)(X_prev, X)
     h = jax.vmap(kernel.observation_model)(X)
-    q = h
-    p = h @ Pinf
-    d = jnp.sum(p * q, axis=1)
-    p = jax.vmap(lambda x, y: x @ y)(p, a)
+    d = jnp.einsum("ni,ij,nj->n", h, Pinf, h)
+    a = jnp.swapaxes(a, -1, -2)
+    p = jax.vmap(lambda x, y: x @ y)(h, a)
+    q = h @ Pinf.T
     return SymmQSM(diag=DiagQSM(d=d), lower=StrictLowerTriQSM(p=p, q=q, a=a))
 
 
@@ -127,9 +127,9 @@ def test_consistent_with_direct(kernel_pair, data, parallel):
         quasisep.Celerite(1.1, 0.8, 0.9, 0.1),
     ],
 )
-def test_to_symm_qsm_matches_legacy(kernel, data):
+def test_to_symm_qsm_matches_reference(kernel, data):
     x, _, _ = data
-    expected = legacy_to_symm_qsm(kernel, x)
+    expected = reference_to_symm_qsm(kernel, x)
     actual = kernel.to_symm_qsm(x)
 
     assert_allclose(actual.diag.d, expected.diag.d)

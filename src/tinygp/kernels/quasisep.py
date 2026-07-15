@@ -47,8 +47,14 @@ def _previous_inputs(X: JAXArray) -> JAXArray:
     )
 
 
+def _matrix_transpose(matrix: JAXArray) -> JAXArray:
+    if isinstance(matrix, Block):
+        return matrix.mT
+    return jnp.swapaxes(matrix, -1, -2)
+
+
 @eqx.filter_jit
-def _to_symm_qsm_impl(kernel: "Quasisep", X: JAXArray) -> SymmQSM:
+def _to_symm_qsm_impl(kernel: Quasisep, X: JAXArray) -> SymmQSM:
     Pinf = kernel.stationary_covariance()
     transition_X = jax.vmap(kernel.transition_coordinate)(X)
     transition_X_prev = _previous_inputs(transition_X)
@@ -62,8 +68,12 @@ def _to_symm_qsm_impl(kernel: "Quasisep", X: JAXArray) -> SymmQSM:
         )
     hP = h @ Pinf
     d = jnp.einsum("ni,ni->n", hP, h)
-    p = jax.vmap(lambda x, y: x @ y)(hP, a)
-    q = h
+    # ``transition_matrix`` uses the adjoint convention, so ``a.T`` is the
+    # forward column-state transition.  Keeping that forward orientation in
+    # the QSM generators is required for non-reversible state-space models.
+    a = _matrix_transpose(a)
+    p = jax.vmap(lambda x, y: x @ y)(h, a)
+    q = h @ Pinf.T
     return SymmQSM(diag=DiagQSM(d=d), lower=StrictLowerTriQSM(p=p, q=q, a=a))
 
 
@@ -74,9 +84,9 @@ class Quasisep(Kernel):
     :class:`tinygp.solvers.quasisep.core.StrictLowerQSM`, this class implements
     ``h``, ``Pinf``, and ``A``, where:
 
-    - ``q = h``,
-    - ``p = h.T @ Pinf @ A``, and
-    - ``a = A``.
+    - ``q = h.T @ Pinf.T``,
+    - ``p = h.T @ A.T``, and
+    - ``a = A.T``.
 
     This notation follows the notation from state space models for stochastic
     differential equations, and so far it seems like a good way to specify these
@@ -101,7 +111,13 @@ class Quasisep(Kernel):
 
     @abstractmethod
     def transition_matrix(self, X1: JAXArray, X2: JAXArray) -> JAXArray:
-        """The transition matrix between two coordinates"""
+        """The adjoint transition matrix between two coordinates.
+
+        If a column-state mean propagates from ``X1`` to ``X2`` as
+        ``m2 = F @ m1``, this method must return ``F.T``. Equivalently, tinygp's
+        Kalman implementation propagates means using
+        ``transition_matrix(X1, X2).T @ m1``.
+        """
         raise NotImplementedError
 
     def coord_to_sortable(self, X: JAXArray) -> JAXArray:
@@ -145,22 +161,25 @@ class Quasisep(Kernel):
 
         Xs = _previous_inputs(X2)
         Pinf = self.stationary_covariance()
-        a = jax.vmap(self.transition_matrix)(Xs, X2)
+        a_adjoint = jax.vmap(self.transition_matrix)(Xs, X2)
+        a = _matrix_transpose(a_adjoint)
         h1 = jax.vmap(self.observation_model)(X1)
         h2 = jax.vmap(self.observation_model)(X2)
 
-        ql = h2
-        pl = h1 @ Pinf
-        qu = h1
-        pu = h2 @ Pinf
+        ql = h2 @ Pinf.T
+        pl = h1
+        qu = h1 @ Pinf
+        pu = h2
 
         i = jnp.clip(idx, 0, ql.shape[0] - 1)
         Xi = jax.tree_util.tree_map(lambda x: jnp.asarray(x)[i], X2)
-        pl = jax.vmap(lambda x, y: x @ y)(pl, jax.vmap(self.transition_matrix)(Xi, X1))
+        transition = jax.vmap(self.transition_matrix)(Xi, X1)
+        pl = jax.vmap(lambda x, y: x @ y.T)(pl, transition)
 
         i = jnp.clip(idx + 1, 0, pu.shape[0] - 1)
         Xi = jax.tree_util.tree_map(lambda x: jnp.asarray(x)[i], X2)
-        qu = jax.vmap(lambda x, y: x @ y)(jax.vmap(self.transition_matrix)(X1, Xi), qu)
+        transition = jax.vmap(self.transition_matrix)(X1, Xi)
+        qu = jax.vmap(lambda x, y: x @ y)(qu, transition)
 
         return GeneralQSM(pl=pl, ql=ql, pu=pu, qu=qu, a=a, idx=idx)
 
@@ -225,8 +244,8 @@ class Quasisep(Kernel):
         h2 = self.observation_model(X2)
         return jnp.where(
             self.coord_to_sortable(X1) < self.coord_to_sortable(X2),
-            h2 @ Pinf @ self.transition_matrix(X1, X2) @ h1,
-            h1 @ Pinf @ self.transition_matrix(X2, X1) @ h2,
+            h2 @ self.transition_matrix(X1, X2).T @ Pinf @ h1,
+            h1 @ self.transition_matrix(X2, X1).T @ Pinf @ h2,
         )
 
     def evaluate_diag(self, X: JAXArray) -> JAXArray:
@@ -336,7 +355,9 @@ class Sum(Quasisep):
         )
 
     def has_delta_transition(self) -> bool:
-        return self.kernel1.has_delta_transition() and self.kernel2.has_delta_transition()
+        return (
+            self.kernel1.has_delta_transition() and self.kernel2.has_delta_transition()
+        )
 
 
 class Product(Quasisep):
@@ -387,7 +408,9 @@ class Product(Quasisep):
         )
 
     def has_delta_transition(self) -> bool:
-        return self.kernel1.has_delta_transition() and self.kernel2.has_delta_transition()
+        return (
+            self.kernel1.has_delta_transition() and self.kernel2.has_delta_transition()
+        )
 
 
 class Scale(Wrapper):
